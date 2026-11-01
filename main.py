@@ -188,9 +188,9 @@ def setup():
         log.error("Set TELEGRAM_TOKEN and GROQ_API_KEY in hosting environment variables.")
         return
     init_db()
-    base = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    base = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
     if base:
-        url = base + "/webhook"
+        url = base if base.endswith("/webhook") else base + "/webhook"
         data = {"url": url}
         if WEBHOOK_SECRET:
             data["secret_token"] = WEBHOOK_SECRET
