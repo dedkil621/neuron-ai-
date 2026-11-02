@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-"""НЕЙРОН — Telegram AI bot for FPS.ms (long polling)."""
+"""НЕЙРОН — Telegram AI bot: chat, photo understanding and image generation."""
 
 import os
 import time
+import base64
 import sqlite3
 import logging
+import mimetypes
+from urllib.parse import quote
+
 import requests
 from dotenv import load_dotenv
 
@@ -12,11 +16,14 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
 OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
 
-MODEL = "openai/gpt-oss-120b"
+TEXT_MODEL = "openai/gpt-oss-120b"
+VISION_MODEL = "qwen/qwen3.6-27b"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+POLLINATIONS_URL = "https://gen.pollinations.ai/image/"
 DB_PATH = os.getenv("DB_PATH", "neuron.db")
 
 logging.basicConfig(
@@ -25,7 +32,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("neuron")
 http = requests.Session()
-http.headers.update({"User-Agent": "NEIRON-Telegram-Bot/1.0"})
+http.headers.update({"User-Agent": "NEIRON-Telegram-Bot/2.0"})
 
 
 def db():
@@ -72,6 +79,24 @@ def send(chat_id, message):
     })
 
 
+def send_photo(chat_id, image_bytes, filename="neuron.png", caption=None):
+    files = {"photo": (filename, image_bytes, "image/jpeg")}
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = str(caption)[:900]
+    response = http.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+        data=data,
+        files=files,
+        timeout=90
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("description", "Telegram не смог отправить картинку"))
+    return payload.get("result")
+
+
 def is_owner(user_id):
     return OWNER_ID is not None and int(user_id) == OWNER_ID
 
@@ -89,7 +114,7 @@ def save_history(user_id, role, content):
     with db() as conn:
         conn.execute(
             "INSERT INTO history(user_id, role, content) VALUES(?,?,?)",
-            (int(user_id), role, content)
+            (int(user_id), role, str(content)[:12000])
         )
         conn.execute(
             """DELETE FROM history WHERE user_id=? AND id NOT IN
@@ -105,27 +130,38 @@ def get_knowledge():
         ).fetchall()
 
 
-def ask_ai(user_id, prompt):
-    if not GROQ_API_KEY:
-        raise RuntimeError("Не задан GROQ_API_KEY в файле .env")
-
+def system_prompt():
     facts = get_knowledge()
     extra = ""
     if facts:
         extra = "\n\nЗнания, добавленные создателем:\n" + "\n".join(
             f"Вопрос: {row['question']}\nОтвет: {row['answer']}" for row in facts
         )
+    return (
+        "Ты НЕЙРОН — умный русскоязычный ИИ-помощник. "
+        "Общайся естественно, без канцелярита и шаблонных повторов. "
+        "Учитывай историю диалога, отвечай по существу и не выдумывай факты. "
+        "Если не знаешь ответа, честно скажи об этом." + extra
+    )
 
-    messages = [{
-        "role": "system",
-        "content": (
-            "Ты НЕЙРОН — дружелюбный, умный русскоязычный ИИ-помощник. "
-            "Общайся естественно, отвечай по существу, учитывай контекст диалога. "
-            "Если не знаешь ответа, честно скажи об этом." + extra
-        )
-    }]
+
+def call_groq(user_id, prompt, image_data_url=None):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Не задан GROQ_API_KEY в файле .env")
+
+    messages = [{"role": "system", "content": system_prompt()}]
     messages.extend(get_history(user_id))
-    messages.append({"role": "user", "content": prompt})
+
+    if image_data_url:
+        content = [
+            {"type": "text", "text": prompt or "Подробно опиши, что изображено на фотографии."},
+            {"type": "image_url", "image_url": {"url": image_data_url}}
+        ]
+        messages.append({"role": "user", "content": content})
+        model = VISION_MODEL
+    else:
+        messages.append({"role": "user", "content": prompt})
+        model = TEXT_MODEL
 
     response = http.post(
         GROQ_URL,
@@ -134,12 +170,12 @@ def ask_ai(user_id, prompt):
             "Content-Type": "application/json"
         },
         json={
-            "model": MODEL,
+            "model": model,
             "messages": messages,
-            "temperature": 0.8,
+            "temperature": 0.7,
             "max_tokens": 1400
         },
-        timeout=90
+        timeout=120
     )
 
     if response.status_code != 200:
@@ -147,27 +183,111 @@ def ask_ai(user_id, prompt):
             detail = response.json().get("error", {}).get("message", response.text)
         except Exception:
             detail = response.text
-        raise RuntimeError(f"Groq API {response.status_code}: {detail[:500]}")
+        raise RuntimeError(f"Groq API {response.status_code}: {detail[:450]}")
 
-    answer = response.json()["choices"][0]["message"]["content"].strip()
+    answer = response.json()["choices"][0]["message"]["content"]
+    if isinstance(answer, list):
+        answer = " ".join(
+            part.get("text", "") for part in answer if isinstance(part, dict)
+        )
+    answer = str(answer or "").strip()
     if not answer:
         answer = "Не получилось сформировать ответ. Попробуй ещё раз."
 
-    save_history(user_id, "user", prompt)
+    saved_prompt = prompt or "Опиши фотографию."
+    save_history(user_id, "user", saved_prompt)
     save_history(user_id, "assistant", answer)
     return answer
+
+
+def download_photo(file_id):
+    file_info = telegram("getFile", {"file_id": file_id})
+    file_path = file_info.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram не вернул файл фотографии.")
+
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    response = http.get(url, timeout=60)
+    response.raise_for_status()
+    if len(response.content) > 18 * 1024 * 1024:
+        raise RuntimeError("Фотография слишком большая. Отправь фото поменьше.")
+    mime = mimetypes.guess_type(file_path)[0] or "image/jpeg"
+    if mime not in ("image/jpeg", "image/png", "image/webp"):
+        mime = "image/jpeg"
+    encoded = base64.b64encode(response.content).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def generate_image(prompt):
+    if not POLLINATIONS_API_KEY:
+        raise RuntimeError("Не задан POLLINATIONS_API_KEY в .env. Добавь ключ Pollinations.")
+    if not prompt.strip():
+        raise RuntimeError("Напиши, какую картинку нужно нарисовать.")
+
+    url = POLLINATIONS_URL + quote(prompt.strip(), safe="")
+    response = http.get(
+        url,
+        headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"},
+        params={"model": "flux"},
+        timeout=240
+    )
+    if response.status_code != 200:
+        detail = response.text[:350]
+        try:
+            detail = response.json().get("error", detail)
+        except Exception:
+            pass
+        raise RuntimeError(f"Pollinations API {response.status_code}: {detail}")
+    content_type = response.headers.get("Content-Type", "")
+    if not content_type.startswith("image/"):
+        raise RuntimeError("Сервис генерации вернул не изображение. Попробуй другой запрос.")
+    return response.content
+
+
+def is_image_request(text):
+    lowered = text.lower().strip()
+    triggers = (
+        "нарисуй", "сгенерируй картинку", "сгенерируй изображение",
+        "создай картинку", "создай изображение", "сделай картинку",
+        "сделай изображение", "/image"
+    )
+    return any(lowered.startswith(item) for item in triggers)
+
+
+def image_prompt(text):
+    raw = text.strip()
+    if raw.lower().startswith("/image"):
+        return raw[len("/image"):].strip()
+    for prefix in (
+        "сгенерируй изображение", "сгенерируй картинку",
+        "создай изображение", "создай картинку",
+        "сделай изображение", "сделай картинку", "нарисуй"
+    ):
+        if raw.lower().startswith(prefix):
+            return raw[len(prefix):].strip(" :,-")
+    return raw
 
 
 def handle_message(message):
     chat_id = message.get("chat", {}).get("id")
     user_id = message.get("from", {}).get("id")
-    text = (message.get("text") or "").strip()
-
-    if not chat_id or not user_id or not text:
+    if not chat_id or not user_id:
         return
 
+    text = (message.get("text") or message.get("caption") or "").strip()
+    photos = message.get("photo") or []
+
     if text.startswith("/start"):
-        send(chat_id, "Привет! Я НЕЙРОН — ИИ-помощник. Просто напиши мне сообщение.\nКоманды: /help, /id, /reset")
+        send(
+            chat_id,
+            "Привет! Я НЕЙРОН — ИИ-помощник.\n\n"
+            "Можешь общаться со мной, отправлять фотографии и просить создавать картинки.\n\n"
+            "Примеры:\n"
+            "• отправь фото и спроси, что на нём\n"
+            "• /image космический кот в неоновом городе\n"
+            "• нарисуй уютный дом у озера\n\n"
+            "Команды: /help, /id, /reset"
+        )
     elif text.startswith("/help"):
         send(
             chat_id,
@@ -175,9 +295,11 @@ def handle_message(message):
             "/help — помощь\n"
             "/id — твой Telegram ID\n"
             "/reset — очистить историю\n"
+            "/image описание — создать картинку\n"
+            "Отправь фото с подписью или без — НЕЙРОН его изучит.\n"
             "/teach вопрос | ответ — добавить знание (создатель)\n"
             "/knowledge — показать базу знаний (создатель)\n"
-            "/clear_knowledge — очистить базу (создатель)"
+            "/clear_knowledge — очистить базу знаний (создатель)"
         )
     elif text.startswith("/id"):
         send(chat_id, f"Твой Telegram ID: {user_id}")
@@ -222,10 +344,38 @@ def handle_message(message):
         with db() as conn:
             conn.execute("DELETE FROM knowledge")
         send(chat_id, "Общая база знаний очищена.")
-    else:
+    elif photos:
         try:
             telegram("sendChatAction", {"chat_id": chat_id, "action": "typing"})
-            send(chat_id, ask_ai(user_id, text))
+            best_photo = max(photos, key=lambda item: item.get("file_size", 0))
+            image_data = download_photo(best_photo["file_id"])
+            answer = call_groq(
+                user_id,
+                text or "Подробно опиши, что изображено на фотографии.",
+                image_data_url=image_data
+            )
+            send(chat_id, answer)
+        except Exception as error:
+            log.exception("Не удалось обработать фотографию")
+            send(chat_id, f"Не получилось изучить фото: {str(error)[:500]}")
+    elif text and is_image_request(text):
+        prompt = image_prompt(text)
+        if not prompt:
+            send(chat_id, "Напиши описание картинки. Например: /image рыжий кот в космосе.")
+            return
+        try:
+            telegram("sendChatAction", {"chat_id": chat_id, "action": "upload_photo"})
+            image_bytes = generate_image(prompt)
+            send_photo(chat_id, image_bytes, filename="neuron-generated.jpg", caption="Готово! Картинка от НЕЙРОНа.")
+            save_history(user_id, "user", "Создай изображение: " + prompt)
+            save_history(user_id, "assistant", "Я создал изображение по запросу пользователя.")
+        except Exception as error:
+            log.exception("Не удалось создать изображение")
+            send(chat_id, f"Не получилось создать картинку: {str(error)[:500]}")
+    elif text:
+        try:
+            telegram("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+            send(chat_id, call_groq(user_id, text))
         except Exception as error:
             log.exception("Не удалось обработать сообщение")
             send(chat_id, f"Ошибка ИИ: {str(error)[:700]}")
@@ -233,13 +383,11 @@ def handle_message(message):
 
 def main():
     if not TELEGRAM_TOKEN:
-        raise SystemExit("Не найден TELEGRAM_TOKEN. Создай .env и добавь токен.")
+        raise SystemExit("Не найден TELEGRAM_TOKEN. Добавь токен в .env.")
     if not GROQ_API_KEY:
         raise SystemExit("Не найден GROQ_API_KEY. Добавь ключ Groq в .env.")
 
     init_db()
-
-    # FPS.ms free Telegram bot servers use polling, not webhooks.
     telegram("deleteWebhook", {"drop_pending_updates": False})
     log.info("НЕЙРОН запущен. Ожидаю сообщения...")
 
